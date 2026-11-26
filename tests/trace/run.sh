@@ -18,6 +18,7 @@ UPSTREAM=b85be4d66e9c89d203840cbe7fa0f638a44cdde2   # jamesrhg/cfl-mii main, 202
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
 res=${1:?usage: run.sh CFL_Res.dat [count] [seed] [-- options]}
+[ -f "$res" ] || { echo "run.sh: no such file: $res" >&2; exit 2; }
 res=$(cd "$(dirname "$res")" && pwd)/$(basename "$res")
 shift
 count=5000; seed=1
@@ -36,9 +37,9 @@ build() {   # build NAME SOURCE_ROOT
 build upstream "$work/upstream-src"
 build current "$repo"
 
-run() {   # run NAME [options]: the summary lines into NAME.txt (in the background)
+run() {   # run NAME [options]: the summary lines into NAME.txt and the exit status into NAME.rc (in the background)
     name=$1; shift
-    "$work/$name" "$res" --count "$count" --seed "$seed" "$@" > "$work/$name.txt" &
+    ( rc=0; "$work/$name" "$res" --count "$count" --seed "$seed" "$@" > "$work/$name.txt" || rc=$?; echo $rc > "$work/$name.rc" ) &
 }
 start=$(date +%s)
 run upstream "$@"
@@ -50,6 +51,13 @@ if grep -q CFL_HAS_FRAME_STEPS "$repo/include/cfl_mii.h"; then
     paths="current frames"
 fi
 wait
+for name in upstream $paths; do   # a build that failed or built nothing compares equal to another: never a pass
+    rc=$(cat "$work/$name.rc")
+    if [ "$rc" != 0 ] || [ ! -s "$work/$name.txt" ]; then
+        echo "$name: cfl-trace failed (exit $rc, $(wc -l < "$work/$name.txt" | tr -d ' ') Miis); see the error above" >&2
+        exit 2
+    fi
+done
 echo "$(wc -l < "$work/upstream.txt" | tr -d ' ') Miis, built $(echo $paths | wc -w | tr -d ' ')+1 ways, in $(( $(date +%s) - start )) s"
 
 status=0
