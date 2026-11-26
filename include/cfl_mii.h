@@ -92,6 +92,28 @@ bool CFL_Initialize(void);
 
 void CFL_Finalize(void);
 
+// CFL_Initialize and CFL_Finalize in two halves, so the file work can run on
+// another thread than the one that owns citro3d:
+// - CFL_LoadResource / CFL_FreeResource: CFL_Res.dat and the CFL_DB.dat cache.
+//   File I/O and memory only, no GPU calls; any one thread at a time.
+// - CFL_InitGpu / CFL_FiniGpu: the shader and light environments, on the
+//   citro3d thread. Neither binds anything (CFL_RebindShader does); call
+//   CFL_FiniGpu between frames, once nothing drawn with the shader is queued.
+// CFL_Initialize is CFL_LoadResource + CFL_InitGpu + CFL_RebindShader, and
+// CFL_Finalize is CFL_FiniGpu + CFL_FreeResource.
+bool CFL_LoadResource(void);
+void CFL_FreeResource(void);
+bool CFL_InitGpu(void);
+void CFL_FiniGpu(void);
+
+// The recently-seen write: CFL_InitCharModel adds every Mii it builds to the
+// console's recently-seen list in CFL_DB.dat (unless its author is on the
+// console's blocklist, ubll.lst). Both are NAND file I/O. With
+// CFL_SetAutoAddRecent(false), model building does neither and the caller
+// calls CFL_AddRecent itself, on the thread that loaded the resource.
+void CFL_SetAutoAddRecent(bool enable);
+bool CFL_AddRecent(const MiiData* mii);
+
 void CFL_EnableSDDebug(bool enable);
 
 void CFL_FlushSDDebug(void);
@@ -170,6 +192,61 @@ typedef struct {
 void CFL_DrawIconHead(CFLCharModel* model, CFLExpression expression, const CFLIconSetting* setting, const C3D_Mtx* projection, const C3D_Mtx* modelView);
 
 bool CFL_CommandMakeModelIcon(CFLCharModel* model, CFLExpression expression, int iconSize, const CFLIconSetting* setting, C3D_Tex* outIcon);
+
+// ---- Building inside the caller's frames ----
+#define CFL_HAS_FRAME_STEPS 1   // this API is here (tests/trace builds against versions with and without it)
+// CFL_InitCharModel and CFL_CommandMakeModelIcon each run whole SYNCDRAW frames
+// of their own and wait for them. These run the same work a step at a time,
+// each pass drawn into the C3D frame the caller already has open (between its
+// C3D_FrameBegin and C3D_FrameEnd), with no waits:
+// - CFL_BeginCharModel sets a build up (no GPU work). Then call
+//   CFL_StepCharModel once per frame until it returns CFL_BUILD_DONE or
+//   CFL_BUILD_FAILED: the face bake, one step per mask expression, then the
+//   other parts (CPU only). Each step binds the CFL shader; the caller restores
+//   its own GPU state afterwards. On failure, CFL_DeleteModel frees what was
+//   built (once the GPU is done with it, as below).
+// - CFL_DrawModelIcon draws the icon into outIcon (zeroed or holding nothing)
+//   in the open frame. Its pixels are there once that frame has finished on
+//   the GPU.
+// The render targets, decal textures and buffers these passes use are tagged
+// with the epoch set by CFL_SetFrameEpoch. Free them with CFL_FreePending(e),
+// outside a frame, once every frame of epochs <= e has finished on the GPU;
+// it deletes render targets, which C3D forbids inside a frame. The model's own
+// textures (face, mask) and the icon belong to the caller as usual.
+typedef enum {
+	CFL_BUILD_FAILED = -1,
+	CFL_BUILD_MORE = 0,
+	CFL_BUILD_DONE = 1,
+} CFLBuildResult;
+
+enum {
+	CFL_BUILD_STEP_FACE = 1,
+	CFL_BUILD_STEP_MASK,
+	CFL_BUILD_STEP_PARTS,
+	CFL_BUILD_STEP_DONE,
+	CFL_BUILD_STEP_FAILED,
+};
+
+typedef struct {
+	CFLCharModel* model;
+	MiiData mii;
+	u32 canvasSize;
+	CFLExpressionFlag expressionFlags;
+	CFLExpression startExpr;
+	CFLHairMode hairMode;
+	int step;
+	int maskExpr, maskRequested, maskBaked;
+	u32 vramBeforeBakes;
+	float anchors[9];
+	bool ownFrames;    // internal: CFL_InitCharModel's own SYNCDRAW frames
+} CFLModelBuild;
+
+bool CFL_BeginCharModel(CFLModelBuild* build, CFLCharModel* model, const MiiData* mii, CFLResolution resolution, CFLExpressionFlag expressionFlags, CFLHairMode hairMode);
+CFLBuildResult CFL_StepCharModel(CFLModelBuild* build);
+bool CFL_DrawModelIcon(CFLCharModel* model, CFLExpression expression, int iconSize, const CFLIconSetting* setting, C3D_Tex* outIcon);
+void CFL_SetFrameEpoch(u32 epoch);
+int CFL_FreePending(u32 doneEpoch);   // the number freed
+int CFL_PendingCount(void);
 
 #ifdef __cplusplus
 }

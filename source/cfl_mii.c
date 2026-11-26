@@ -987,10 +987,24 @@ static void uploadMaterialColor(const float color[3])
 	C3D_LightEnvMaterial(&s_bakeLightEnv, &mtl);
 }
 
-#define MAX_PENDING_DECAL_CLEANUP 16
-typedef struct { C3D_Tex tex; void* vbo; void* ibo; } PendingDecalCleanup;
+// Temporaries a pass leaves for the GPU: decal textures and buffers, and the
+// render targets of passes drawn into the caller's frame. A pass that runs its
+// own SYNCDRAW frame frees them at once (flushDecalCleanup); a pass drawn into
+// the caller's frame tags them with the caller's epoch (CFL_SetFrameEpoch) and
+// the caller frees them with CFL_FreePending once the GPU is done with them.
+#define MAX_PENDING_DECAL_CLEANUP 64
+typedef struct { C3D_Tex tex; void* vbo; void* ibo; C3D_RenderTarget* target; u32 epoch; } PendingDecalCleanup;
 static PendingDecalCleanup pendingDecalCleanup[MAX_PENDING_DECAL_CLEANUP];
 static int pendingDecalCleanupCount = 0;
+static u32 s_frameEpoch = 0;
+
+static void freePendingEntry(PendingDecalCleanup* p)
+{
+	if (p->target) C3D_RenderTargetDelete(p->target);
+	if (p->tex.data) C3D_TexDelete(&p->tex);
+	linearFree(p->vbo);
+	linearFree(p->ibo);
+}
 
 static void queueDecalCleanup(C3D_Tex tex, void* vbo, void* ibo)
 {
@@ -998,17 +1012,62 @@ static void queueDecalCleanup(C3D_Tex tex, void* vbo, void* ibo)
 		dbglog("queueDecalCleanup: pending list full, leaking one decal's buffers\n");
 		return;
 	}
-	pendingDecalCleanup[pendingDecalCleanupCount++] = (PendingDecalCleanup){ tex, vbo, ibo };
+	pendingDecalCleanup[pendingDecalCleanupCount++] = (PendingDecalCleanup){ tex, vbo, ibo, NULL, s_frameEpoch };
+}
+
+// Render targets go first in CFL_FreePending: deleting one waits for the GPU
+// queue, so the textures and buffers after it are no longer in use.
+static void queueTargetCleanup(C3D_RenderTarget* target)
+{
+	if (!target) return;
+	if (pendingDecalCleanupCount >= MAX_PENDING_DECAL_CLEANUP) {
+		dbglog("queueTargetCleanup: pending list full, leaking one render target\n");
+		return;
+	}
+	PendingDecalCleanup p;
+	memset(&p, 0, sizeof(p));
+	p.target = target;
+	p.epoch = s_frameEpoch;
+	pendingDecalCleanup[pendingDecalCleanupCount++] = p;
 }
 
 static void flushDecalCleanup(void)
 {
-	for (int i = 0; i < pendingDecalCleanupCount; i++) {
-		C3D_TexDelete(&pendingDecalCleanup[i].tex);
-		linearFree(pendingDecalCleanup[i].vbo);
-		linearFree(pendingDecalCleanup[i].ibo);
-	}
+	for (int i = 0; i < pendingDecalCleanupCount; i++) freePendingEntry(&pendingDecalCleanup[i]);
 	pendingDecalCleanupCount = 0;
+}
+
+void CFL_SetFrameEpoch(u32 epoch)
+{
+	s_frameEpoch = epoch;
+}
+
+int CFL_FreePending(u32 doneEpoch)
+{
+	int freed = 0, kept = 0;
+	// targets first (see queueTargetCleanup), then the rest
+	for (int pass = 0; pass < 2; pass++) {
+		for (int i = 0; i < pendingDecalCleanupCount; i++) {
+			PendingDecalCleanup* p = &pendingDecalCleanup[i];
+			if (!p->target && !p->tex.data && !p->vbo && !p->ibo) continue;
+			if ((s32)(p->epoch - doneEpoch) > 0) continue;
+			if ((pass == 0) != (p->target != NULL)) continue;
+			freePendingEntry(p);
+			memset(p, 0, sizeof(*p));   // freed: the compaction below drops it
+			freed++;
+		}
+	}
+	for (int i = 0; i < pendingDecalCleanupCount; i++) {
+		PendingDecalCleanup* p = &pendingDecalCleanup[i];
+		if (p->target || p->tex.data || p->vbo || p->ibo) pendingDecalCleanup[kept++] = *p;
+	}
+	pendingDecalCleanupCount = kept;
+	return freed;
+}
+
+int CFL_PendingCount(void)
+{
+	return pendingDecalCleanupCount;
 }
 
 static void drawDecalVerts(const Vertex verts[4], const CFLTexture* tex, const float tint[3])
@@ -1200,7 +1259,9 @@ static int wrapRot32(int r)
 	return r;
 }
 
-static bool bakeMaskTexture(const u8* cflData, u32 cflSize, const MiiData* mii, CFLExpression expression, u32 canvasSize, C3D_Tex* outTex)
+// ownFrame: run its own SYNCDRAW frame (the original behaviour); otherwise draw into
+// the frame the caller has open and leave the target and decals on the pending list.
+static bool bakeMaskTexture(const u8* cflData, u32 cflSize, const MiiData* mii, CFLExpression expression, u32 canvasSize, C3D_Tex* outTex, bool ownFrame)
 {
 	static const float POS_X_ADD          = 3.5323312f;
 	static const float POS_Y_ADD          = 4.629278f;
@@ -1319,7 +1380,7 @@ static bool bakeMaskTexture(const u8* cflData, u32 cflSize, const MiiData* mii, 
 	C3D_Mtx identity;
 	Mtx_Identity(&identity);
 
-	C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+	if (ownFrame) C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
 		
 		GPUCMD_AddWrite(GPUREG_FRAMEBUFFER_INVALIDATE, 1);
 		C3D_FrameDrawOn(maskTarget);
@@ -1380,10 +1441,13 @@ static bool bakeMaskTexture(const u8* cflData, u32 cflSize, const MiiData* mii, 
 		}
 		
 		GPUCMD_AddWrite(GPUREG_FRAMEBUFFER_FLUSH, 1);
-	C3D_FrameEnd(0);
-	flushDecalCleanup();
-
-	C3D_RenderTargetDelete(maskTarget);
+	if (ownFrame) {
+		C3D_FrameEnd(0);
+		flushDecalCleanup();
+		C3D_RenderTargetDelete(maskTarget);
+	} else {
+		queueTargetCleanup(maskTarget);
+	}
 
 	dbglog("Face mask: baked %lux%lu for expr=%s\n", (unsigned long)canvasSize, (unsigned long)canvasSize, CFL_GetExpressionName(expression));
 	*outTex = maskTex;
@@ -1393,7 +1457,7 @@ static bool bakeMaskTexture(const u8* cflData, u32 cflSize, const MiiData* mii, 
 #define FACE_TEX_WIDTH  64
 #define FACE_TEX_HEIGHT 128
 
-static bool buildFaceTexture(CFLCharModel* cm, const u8* cflData, u32 cflSize, const MiiData* mii, const CFLModel* faceModel)
+static bool buildFaceTexture(CFLCharModel* cm, const u8* cflData, u32 cflSize, const MiiData* mii, const CFLModel* faceModel, bool ownFrame)
 {
 	if (!faceModel->texcoords) {
 		dbglog("(face model has no texcoords, skipping faceline texture bake)\n");
@@ -1426,7 +1490,7 @@ static bool buildFaceTexture(CFLCharModel* cm, const u8* cflData, u32 cflSize, c
 		((u32)(skinColors[skinIndex][1] * 255.0f) << 16) |
 		((u32)(skinColors[skinIndex][2] * 255.0f) << 8) | 0xFF;
 
-	C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+	if (ownFrame) C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
 		
 		GPUCMD_AddWrite(GPUREG_FRAMEBUFFER_INVALIDATE, 1);
 		C3D_RenderTargetClear(faceTarget, C3D_CLEAR_ALL, clearColor, 0);
@@ -1456,14 +1520,18 @@ static bool buildFaceTexture(CFLCharModel* cm, const u8* cflData, u32 cflSize, c
 			loadResTexture(cflData, cflSize, CFL_SECTION_FACET_BEARD, mii->beard_details.style - 3, &tex))
 			drawFullCanvasDecal(&tex, hairColors[beardColorIndex]);
 		GPUCMD_AddWrite(GPUREG_FRAMEBUFFER_FLUSH, 1);
-	C3D_FrameEnd(0);
-	flushDecalCleanup();
-
-	C3D_RenderTargetDelete(faceTarget);
+	if (ownFrame) {
+		C3D_FrameEnd(0);
+		flushDecalCleanup();
+		C3D_RenderTargetDelete(faceTarget);
+	} else {
+		queueTargetCleanup(faceTarget);
+	}
 	C3D_TexSetFilter(&faceTex, GPU_LINEAR, GPU_LINEAR);
 	C3D_TexSetWrap(&faceTex, GPU_MIRRORED_REPEAT, GPU_CLAMP_TO_EDGE);
 	if (addTexturedPart(cm, faceModel, NULL, 1.0f, false, &faceTex, true) < 0) {
-		C3D_TexDelete(&faceTex);
+		if (ownFrame) C3D_TexDelete(&faceTex);
+		else queueDecalCleanup(faceTex, NULL, NULL);   // the GPU has yet to draw into it
 		dbglog("(too many parts already, discarding faceline texture)\n");
 		return false;
 	}
@@ -1642,10 +1710,10 @@ bool CFL_GetMyMiiIndex(u16* outIndex)
 #define CFL_RECENT_RECORDS_OFFSET 0x6c
 #define CFL_RECENT_RECORD_SIZE   72
 
-typedef struct {
-	u64 uid;
-	u32 dateTime;
-} CFLiUblEntry;
+// ubll.lst holds packed 12-byte entries (a u64 author id, then a u32 time),
+// 12000 bytes in all. A padded struct would ask for 16000 bytes, the read would
+// come back short and the blocklist would never apply.
+#define CFLI_UBL_ENTRY_SIZE  12
 #define CFLI_UBL_MAX_ENTRIES 1000
 #define CFLI_UBL_NG_TIME     7
 
@@ -1666,7 +1734,7 @@ static bool CFLi_UblIsExist(u64 authorId)
 		return false;
 	}
 
-	static CFLiUblEntry entries[CFLI_UBL_MAX_ENTRIES];
+	static u8 entries[CFLI_UBL_MAX_ENTRIES * CFLI_UBL_ENTRY_SIZE];
 	u32 got = 0;
 	rc = FSFILE_Read(file, &got, 0, entries, sizeof(entries));
 	FSFILE_Close(file);
@@ -1675,7 +1743,11 @@ static bool CFLi_UblIsExist(u64 authorId)
 	if (R_FAILED(rc) || got != sizeof(entries)) return false;
 
 	for (int i = 0; i < CFLI_UBL_MAX_ENTRIES; i++) {
-		if (entries[i].uid == authorId && entries[i].dateTime != CFLI_UBL_NG_TIME) return true;
+		u64 uid;
+		u32 dateTime;
+		memcpy(&uid, entries + i * CFLI_UBL_ENTRY_SIZE, sizeof(uid));
+		memcpy(&dateTime, entries + i * CFLI_UBL_ENTRY_SIZE + 8, sizeof(dateTime));
+		if (uid == authorId && dateTime != CFLI_UBL_NG_TIME) return true;
 	}
 	return false;
 }
@@ -1835,6 +1907,23 @@ static bool CFLi_AddRecentDBData(const MiiData* mii)
 	return true;
 }
 
+static bool s_autoAddRecent = true;
+
+void CFL_SetAutoAddRecent(bool enable)
+{
+	s_autoAddRecent = enable;
+}
+
+bool CFL_AddRecent(const MiiData* mii)
+{
+	if (!mii) return false;
+	if (CFLi_ReplaceProhibitedCharInfo(mii)) {
+		dbglog("CFL_AddRecent: skipped - author is on this console's own local nn::ubl blocklist (CFLi_ReplaceProhibitedCharInfo)\n");
+		return false;
+	}
+	return CFLi_AddRecentDBData(mii);
+}
+
 int CFL_GetWorkSize(bool hdModeEnabled)
 {
 	int base = hdModeEnabled ? 1024 : 128;
@@ -1842,8 +1931,9 @@ int CFL_GetWorkSize(bool hdModeEnabled)
 	return size + 0x400e0;
 }
 
-bool CFL_Initialize(void)
+bool CFL_LoadResource(void)
 {
+	if (g_cflData) return true;
 	dbglog("Opening CFL_Res.dat system archive...\n");
 	u32 cflSize = 0;
 	if (!loadMiiResource(&cflSize)) {
@@ -1855,8 +1945,26 @@ bool CFL_Initialize(void)
 	g_cflSize = cflSize;
 
 	ensureDatabaseCacheLoaded();
+	return true;
+}
 
+void CFL_FreeResource(void)
+{
+	free(g_cflResBuffer);
+	g_cflResBuffer = NULL;
+	g_cflData = NULL;
+	g_cflSize = 0;
+
+	g_cflDbCacheValid = false;
+}
+
+static bool s_gpuReady = false;
+
+bool CFL_InitGpu(void)
+{
+	if (s_gpuReady) return true;
 	vshader_dvlb = DVLB_ParseFile((u32*)vshader_shbin, vshader_shbin_size);
+	if (!vshader_dvlb) return false;
 	shaderProgramInit(&program);
 	shaderProgramSetVsh(&program, &vshader_dvlb->DVLE[0]);
 
@@ -1873,8 +1981,27 @@ bool CFL_Initialize(void)
 	C3D_LightSpecular1(&s_bakeLight, 0.0f, 0.0f, 0.0f);
 	C3D_LightEnable(&s_bakeLight, true);
 
-	CFL_RebindShader();
+	s_gpuReady = true;
+	return true;
+}
 
+void CFL_FiniGpu(void)
+{
+	if (!s_gpuReady) return;
+	shaderProgramFree(&program);
+	DVLB_Free(vshader_dvlb);
+	vshader_dvlb = NULL;
+	s_gpuReady = false;
+}
+
+bool CFL_Initialize(void)
+{
+	if (!CFL_LoadResource()) return false;
+	if (!CFL_InitGpu()) {
+		CFL_FreeResource();
+		return false;
+	}
+	CFL_RebindShader();
 	return true;
 }
 
@@ -1899,14 +2026,8 @@ void CFL_RebindShader(void)
 
 void CFL_Finalize(void)
 {
-	shaderProgramFree(&program);
-	DVLB_Free(vshader_dvlb);
-	free(g_cflResBuffer);
-	g_cflResBuffer = NULL;
-	g_cflData = NULL;
-	g_cflSize = 0;
-	
-	g_cflDbCacheValid = false;
+	CFL_FiniGpu();
+	CFL_FreeResource();
 }
 
 void CFL_DeleteModel(CFLCharModel* cm)
@@ -1928,17 +2049,27 @@ bool CFL_InitCharModel(CFLCharModel* cm, const MiiData* miiIn, CFLResolution res
 
 bool CFL_InitCharModelWithHairMode(CFLCharModel* cm, const MiiData* miiIn, CFLResolution resolution, CFLExpressionFlag expressionFlags, CFLHairMode hairMode)
 {
+	CFLModelBuild b;
+	if (!CFL_BeginCharModel(&b, cm, miiIn, resolution, expressionFlags, hairMode)) return false;
+	b.ownFrames = true;
+	CFLBuildResult r;
+	while ((r = CFL_StepCharModel(&b)) == CFL_BUILD_MORE) {}
+	return r == CFL_BUILD_DONE;
+}
+
+bool CFL_BeginCharModel(CFLModelBuild* b, CFLCharModel* cm, const MiiData* miiIn, CFLResolution resolution, CFLExpressionFlag expressionFlags, CFLHairMode hairMode)
+{
+	if (!b) return false;
+	memset(b, 0, sizeof(*b));
 	if (!cm || !miiIn || (unsigned)hairMode > CFL_HAIR_HIDDEN) return false;
 	// Copy before clearing: callers may rebuild directly from &cm->mii.
-	MiiData mii = *miiIn;
+	b->mii = *miiIn;
 	if (!g_cflData) {
 		dbglog("CFL_InitCharModel: called before a successful CFL_Initialize()\n");
 		return false;
 	}
-	const u8* cflData = g_cflData;
-	u32 cflSize = g_cflSize;
-
-	CFL_RebindShader();
+	b->model = cm;
+	b->hairMode = hairMode;
 
 	dbglogVramStats("CFL_InitCharModel start", false);
 
@@ -1950,154 +2081,188 @@ bool CFL_InitCharModelWithHairMode(CFLCharModel* cm, const MiiData* miiIn, CFLRe
 		dbglog("CFL_InitCharModel: expressionFlags must have at least one bit set (matches CFL's own CFLi_GetExpressionCount(...) > 0 assert) - defaulting to NORMAL only.\n");
 		expressionFlags = CFL_EXPRESSION_FLAG(CFL_EXPRESSION_NORMAL);
 	}
-	u32 canvasSize = snapResolution(resolution);
+	b->expressionFlags = expressionFlags;
+	b->canvasSize = snapResolution(resolution);
 
-	CFLExpression startExpr = CFL_EXPRESSION_NORMAL;
+	b->startExpr = CFL_EXPRESSION_NORMAL;
 	if (!(expressionFlags & CFL_EXPRESSION_FLAG(CFL_EXPRESSION_NORMAL))) {
 		for (int i = 0; i < CFL_EXPRESSION_COUNT; i++) {
-			if (expressionFlags & CFL_EXPRESSION_FLAG(i)) { startExpr = (CFLExpression)i; break; }
+			if (expressionFlags & CFL_EXPRESSION_FLAG(i)) { b->startExpr = (CFLExpression)i; break; }
 		}
 	}
 
+	const MiiData* mii = &b->mii;
 	dbglog("face shape=%u skinColor=%u hair style=%u color=%u flip=%u sex=%u(%s) favColor=%u\n",
-		mii.face_style.shape, mii.face_style.skinColor,
-		mii.hair_style, mii.hair_details.color, mii.hair_details.flip,
-		mii.mii_details.sex, mii.mii_details.sex ? "female" : "male", mii.mii_details.shirt_color);
+		mii->face_style.shape, mii->face_style.skinColor,
+		mii->hair_style, mii->hair_details.color, mii->hair_details.flip,
+		mii->mii_details.sex, mii->mii_details.sex ? "female" : "male", mii->mii_details.shirt_color);
 	dbglog("resolution: requested=%lu snapped=%lu   expressionFlags=0x%lx startExpr=%s\n",
-		(unsigned long)resolution, (unsigned long)canvasSize, (unsigned long)expressionFlags, CFL_GetExpressionName(startExpr));
+		(unsigned long)resolution, (unsigned long)b->canvasSize, (unsigned long)expressionFlags, CFL_GetExpressionName(b->startExpr));
+	b->step = CFL_BUILD_STEP_FACE;
+	return true;
+}
 
-	u8 skinIndex = mii.face_style.skinColor;
+static void buildFail(CFLModelBuild* b)
+{
+	// The part buffers and textures stay with the model (CFL_DeleteModel frees
+	// them); with in-frame passes, only once the GPU is done with this frame.
+	b->step = CFL_BUILD_STEP_FAILED;
+}
+
+CFLBuildResult CFL_StepCharModel(CFLModelBuild* b)
+{
+	if (!b || !b->model || b->step == CFL_BUILD_STEP_FAILED) return CFL_BUILD_FAILED;
+	if (b->step == CFL_BUILD_STEP_DONE) return CFL_BUILD_DONE;
+	if (!g_cflData) { buildFail(b); return CFL_BUILD_FAILED; }
+	CFLCharModel* cm = b->model;
+	const MiiData* mii = &b->mii;
+	const u8* cflData = g_cflData;
+	u32 cflSize = g_cflSize;
+
+	u8 skinIndex = mii->face_style.skinColor;
 	if (skinIndex >= 6) skinIndex = 0;
-	u8 hairColorIndex = mii.hair_details.color;
+	u8 hairColorIndex = mii->hair_details.color;
 	if (hairColorIndex >= 8) hairColorIndex = 0;
-	u8 favColorIndex = mii.mii_details.shirt_color;
-
-	u32 hairIndex = (u32)mii.hair_style * 2 + (hairMode == CFL_HAIR_HAT);
-	dbglog("Hair index: rawStyle=%u -> %lu\n", mii.hair_style, (unsigned long)hairIndex);
-
+	u8 favColorIndex = mii->mii_details.shirt_color;
+	u32 hairIndex = (u32)mii->hair_style * 2 + (b->hairMode == CFL_HAIR_HAT);
 	CFLFaceAnchors anchors;
-	{
+	memcpy(&anchors, b->anchors, sizeof(anchors));
+
+	switch (b->step) {
+	case CFL_BUILD_STEP_FACE: {
+		CFL_RebindShader();
+		dbglog("Hair index: rawStyle=%u -> %lu\n", mii->hair_style, (unsigned long)hairIndex);
 		CFLModel faceModel;
-		if (!loadResModel(cflData, cflSize, CFL_SECTION_FACE, mii.face_style.shape, &anchors, &faceModel)) {
+		if (!loadResModel(cflData, cflSize, CFL_SECTION_FACE, mii->face_style.shape, &anchors, &faceModel)) {
 			dbglogErr("\nFailed to parse the face model.\n");
 			dbglogVramStats("CFL_InitCharModel face model parse failure", true);
-			return false;
+			buildFail(b);
+			return CFL_BUILD_FAILED;
 		}
+		memcpy(b->anchors, &anchors, sizeof(anchors));
 		dbglog("Face: %lu verts, %lu indices (hair anchor %.2f %.2f %.2f)\n",
 			(unsigned long)faceModel.vertexCount, (unsigned long)faceModel.indexCount,
 			anchors.hair[0], anchors.hair[1], anchors.hair[2]);
-		if (!buildFaceTexture(cm, cflData, cflSize, &mii, &faceModel))
+		if (!buildFaceTexture(cm, cflData, cflSize, mii, &faceModel, b->ownFrames))
 			addPart(cm, &faceModel, NULL, 1.0f, false, skinColors[skinIndex], false);
 		logNormalLightStats("FACE", &faceModel);
 		freeResModel(&faceModel);
+		// A failed face allocation must not produce a supposedly valid icon.
+		if (cm->partCount == 0) { buildFail(b); return CFL_BUILD_FAILED; }
+		b->step = CFL_BUILD_STEP_MASK;
+		b->maskExpr = 0;
+		return CFL_BUILD_MORE;
 	}
-	// A failed face allocation must not produce a supposedly valid icon.
-	if (cm->partCount == 0) return false;
-
-	{
-		CFLModel canvasModel;
-		if (loadResModel(cflData, cflSize, CFL_SECTION_MASK, mii.face_style.shape, NULL, &canvasModel)) {
-			
-			int requestedCount = 0, bakedCount = 0;
-			u32 vramBeforeBakes = vramSpaceFree();
-			dbglog("CFL_InitCharModel: VRAM free before baking = %lu bytes (%.1f KB)\n", (unsigned long)vramBeforeBakes, vramBeforeBakes / 1024.0f);
-			for (int i = 0; i < CFL_EXPRESSION_COUNT; i++) {
-				if (!(expressionFlags & CFL_EXPRESSION_FLAG(i))) continue;
-				requestedCount++;
-				if (bakeMaskTexture(cflData, cflSize, &mii, (CFLExpression)i, canvasSize, &cm->maskTexForExpr[i])) {
-					C3D_TexSetFilter(&cm->maskTexForExpr[i], GPU_LINEAR, GPU_LINEAR);
-					C3D_TexSetWrap(&cm->maskTexForExpr[i], GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
-					cm->maskTexBaked[i] = true;
-					bakedCount++;
-				} else {
-					
-					dbglogErr("CFL_InitCharModel: FAILED to bake MASK for expression %s (likely VRAM exhaustion)\n", CFL_GetExpressionName((CFLExpression)i));
-					dbglogVramStats("  at failure", true);
-				}
-			}
-			u32 vramAfterBakes = vramSpaceFree();
-			u32 vramUsedByBakes = (vramBeforeBakes > vramAfterBakes) ? (vramBeforeBakes - vramAfterBakes) : 0;
-			dbglog("CFL_InitCharModel: VRAM free after baking = %lu bytes (%.1f KB) - this model's %d successfully baked MASK texture(s) used ~%lu bytes (%.1f KB)\n",
-				(unsigned long)vramAfterBakes, vramAfterBakes / 1024.0f, bakedCount, (unsigned long)vramUsedByBakes, vramUsedByBakes / 1024.0f);
-			if (bakedCount < requestedCount) {
-				dbglogErr("CFL_InitCharModel: only %d/%d requested expressions baked successfully\n", bakedCount, requestedCount);
+	case CFL_BUILD_STEP_MASK: {
+		// One expression per step: each bake is one pass.
+		while (b->maskExpr < CFL_EXPRESSION_COUNT && !(b->expressionFlags & CFL_EXPRESSION_FLAG(b->maskExpr))) b->maskExpr++;
+		if (b->maskExpr < CFL_EXPRESSION_COUNT) {
+			int i = b->maskExpr++;
+			if (b->maskRequested == 0) b->vramBeforeBakes = vramSpaceFree();
+			b->maskRequested++;
+			CFL_RebindShader();
+			if (bakeMaskTexture(cflData, cflSize, mii, (CFLExpression)i, b->canvasSize, &cm->maskTexForExpr[i], b->ownFrames)) {
+				C3D_TexSetFilter(&cm->maskTexForExpr[i], GPU_LINEAR, GPU_LINEAR);
+				C3D_TexSetWrap(&cm->maskTexForExpr[i], GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+				cm->maskTexBaked[i] = true;
+				b->maskBaked++;
 			} else {
-				dbglog("CFL_InitCharModel: all %d requested expressions baked successfully\n", requestedCount);
+				dbglogErr("CFL_InitCharModel: FAILED to bake MASK for expression %s (likely VRAM exhaustion)\n", CFL_GetExpressionName((CFLExpression)i));
+				dbglogVramStats("  at failure", true);
 			}
-			if (cm->maskTexBaked[startExpr]) {
-				cm->maskPartIndex = addTexturedPart(cm, &canvasModel, NULL, 1.0f, false, &cm->maskTexForExpr[startExpr], false);
+			// the remaining expressions, if any, on the next steps
+			while (b->maskExpr < CFL_EXPRESSION_COUNT && !(b->expressionFlags & CFL_EXPRESSION_FLAG(b->maskExpr))) b->maskExpr++;
+			if (b->maskExpr < CFL_EXPRESSION_COUNT) return CFL_BUILD_MORE;
+		}
+		CFLModel canvasModel;
+		if (loadResModel(cflData, cflSize, CFL_SECTION_MASK, mii->face_style.shape, NULL, &canvasModel)) {
+			u32 vramAfterBakes = vramSpaceFree();
+			u32 vramUsedByBakes = (b->vramBeforeBakes > vramAfterBakes) ? (b->vramBeforeBakes - vramAfterBakes) : 0;
+			dbglog("CFL_InitCharModel: VRAM free after baking = %lu bytes (%.1f KB) - this model's %d successfully baked MASK texture(s) used ~%lu bytes (%.1f KB)\n",
+				(unsigned long)vramAfterBakes, vramAfterBakes / 1024.0f, b->maskBaked, (unsigned long)vramUsedByBakes, vramUsedByBakes / 1024.0f);
+			if (b->maskBaked < b->maskRequested) {
+				dbglogErr("CFL_InitCharModel: only %d/%d requested expressions baked successfully\n", b->maskBaked, b->maskRequested);
+			} else {
+				dbglog("CFL_InitCharModel: all %d requested expressions baked successfully\n", b->maskRequested);
+			}
+			if (cm->maskTexBaked[b->startExpr]) {
+				cm->maskPartIndex = addTexturedPart(cm, &canvasModel, NULL, 1.0f, false, &cm->maskTexForExpr[b->startExpr], false);
 				if (cm->maskPartIndex < 0)
 					dbglogErr("CFL_InitCharModel: too many parts already, MASK not attached (still pre-baked, unused)\n");
 			} else {
-				dbglogErr("CFL_InitCharModel: starting expression %s failed to bake, MASK will be missing\n", CFL_GetExpressionName(startExpr));
+				dbglogErr("CFL_InitCharModel: starting expression %s failed to bake, MASK will be missing\n", CFL_GetExpressionName(b->startExpr));
 			}
 			freeResModel(&canvasModel);
 		} else {
 			dbglogErr("(no face canvas at section %lu item %u, skipping MASK entirely)\n",
-				(unsigned long)CFL_SECTION_MASK, mii.face_style.shape);
+				(unsigned long)CFL_SECTION_MASK, mii->face_style.shape);
 		}
+		b->step = CFL_BUILD_STEP_PARTS;
+		return CFL_BUILD_MORE;
 	}
+	case CFL_BUILD_STEP_PARTS: {
+		if (b->hairMode != CFL_HAIR_HIDDEN) {
+			loadTexturedPart(cm, cflData, cflSize, CFL_SECTION_CAP, hairIndex, CFL_SECTION_CAPTEX, mii->hair_style,
+				anchors.hair, 1.0f, mii->hair_details.flip != 0,
+				CFL_GetFavoriteColor(favColorIndex), NULL, true, false, true, "Cap");
 
-	if (hairMode != CFL_HAIR_HIDDEN) {
-		loadTexturedPart(cm, cflData, cflSize, CFL_SECTION_CAP, hairIndex, CFL_SECTION_CAPTEX, mii.hair_style,
-			anchors.hair, 1.0f, mii.hair_details.flip != 0,
-			CFL_GetFavoriteColor(favColorIndex), NULL, true, false, true, "Cap");
+			loadPart(cm, cflData, cflSize, CFL_SECTION_HAIR, hairIndex, anchors.hair, 1.0f, mii->hair_details.flip != 0,
+				hairColors[hairColorIndex], false, "Hair");
+			loadPart(cm, cflData, cflSize, CFL_SECTION_FOREHEAD, hairIndex, anchors.hair, 1.0f, mii->hair_details.flip != 0,
+				skinColors[skinIndex], false, "Forehead");
+		}
 
-		loadPart(cm, cflData, cflSize, CFL_SECTION_HAIR, hairIndex, anchors.hair, 1.0f, mii.hair_details.flip != 0,
-			hairColors[hairColorIndex], false, "Hair");
-		loadPart(cm, cflData, cflSize, CFL_SECTION_FOREHEAD, hairIndex, anchors.hair, 1.0f, mii.hair_details.flip != 0,
-			skinColors[skinIndex], false, "Forehead");
+		if (mii->beard_details.style < 4) {
+			u8 beardColorIndex = mii->beard_details.color;
+			if (beardColorIndex >= 8) beardColorIndex = 0;
+			loadPart(cm, cflData, cflSize, CFL_SECTION_GOATEE, mii->beard_details.style, anchors.goatee, 1.0f, false,
+				hairColors[beardColorIndex], false, "Goatee");
+		}
+
+		{
+			float noseScale = mii->nose_details.scale * 0.175f + 0.4f;
+			float nosePos[3] = {
+				anchors.noseGlasses[0],
+				anchors.noseGlasses[1] + ((float)mii->nose_details.yposition - 8.0f) * -1.5f,
+				anchors.noseGlasses[2],
+			};
+			static const float noselineColor[3] = { 0.0f, 0.0f, 0.0f };
+			loadPart(cm, cflData, cflSize, CFL_SECTION_NOSE, mii->nose_details.style, nosePos, noseScale, false,
+				skinColors[skinIndex], false, "Nose");
+			loadTexturedPart(cm, cflData, cflSize, CFL_SECTION_NLINE, mii->nose_details.style,
+				CFL_SECTION_NLINETEX, mii->nose_details.style, nosePos, noseScale, false, noselineColor, NULL, false, true, false, "Nose canvas");
+		}
+
+		if (mii->glasses_details.style != 0) {
+			float glassScale = mii->glasses_details.scale * 0.15f + 0.4f;
+			float glassPos[3] = {
+				anchors.noseGlasses[0],
+				anchors.noseGlasses[1] + ((float)mii->glasses_details.ypos - 11.0f) * -1.5f + 5.0f,
+				anchors.noseGlasses[2] + 2.0f,
+			};
+			u8 glassColorIndex = mii->glasses_details.color;
+			if (glassColorIndex >= 8) glassColorIndex = 0;
+			
+			loadTexturedPart(cm, cflData, cflSize, CFL_SECTION_GLASSES, 0,
+				CFL_SECTION_GLASSES_TEX, mii->glasses_details.style, glassPos, glassScale, false,
+				glassColors[glassColorIndex], NULL, true, false, false, "Glasses");
+		}
+
+		cm->mii = *mii;
+		cm->expressionFlags = b->expressionFlags;
+		cm->expression = b->startExpr;
+		cm->valid = true;
+
+		if (s_autoAddRecent) CFL_AddRecent(mii);
+
+		dbglog("CFL_InitCharModel: complete\n");
+		b->step = CFL_BUILD_STEP_DONE;
+		return CFL_BUILD_DONE;
 	}
-
-	if (mii.beard_details.style < 4) {
-		u8 beardColorIndex = mii.beard_details.color;
-		if (beardColorIndex >= 8) beardColorIndex = 0;
-		loadPart(cm, cflData, cflSize, CFL_SECTION_GOATEE, mii.beard_details.style, anchors.goatee, 1.0f, false,
-			hairColors[beardColorIndex], false, "Goatee");
+	default:
+		buildFail(b);
+		return CFL_BUILD_FAILED;
 	}
-
-	{
-		float noseScale = mii.nose_details.scale * 0.175f + 0.4f;
-		float nosePos[3] = {
-			anchors.noseGlasses[0],
-			anchors.noseGlasses[1] + ((float)mii.nose_details.yposition - 8.0f) * -1.5f,
-			anchors.noseGlasses[2],
-		};
-		static const float noselineColor[3] = { 0.0f, 0.0f, 0.0f };
-		loadPart(cm, cflData, cflSize, CFL_SECTION_NOSE, mii.nose_details.style, nosePos, noseScale, false,
-			skinColors[skinIndex], false, "Nose");
-		loadTexturedPart(cm, cflData, cflSize, CFL_SECTION_NLINE, mii.nose_details.style,
-			CFL_SECTION_NLINETEX, mii.nose_details.style, nosePos, noseScale, false, noselineColor, NULL, false, true, false, "Nose canvas");
-	}
-
-	if (mii.glasses_details.style != 0) {
-		float glassScale = mii.glasses_details.scale * 0.15f + 0.4f;
-		float glassPos[3] = {
-			anchors.noseGlasses[0],
-			anchors.noseGlasses[1] + ((float)mii.glasses_details.ypos - 11.0f) * -1.5f + 5.0f,
-			anchors.noseGlasses[2] + 2.0f,
-		};
-		u8 glassColorIndex = mii.glasses_details.color;
-		if (glassColorIndex >= 8) glassColorIndex = 0;
-		
-		loadTexturedPart(cm, cflData, cflSize, CFL_SECTION_GLASSES, 0,
-			CFL_SECTION_GLASSES_TEX, mii.glasses_details.style, glassPos, glassScale, false,
-			glassColors[glassColorIndex], NULL, true, false, false, "Glasses");
-	}
-
-	cm->mii = mii;
-	cm->expressionFlags = expressionFlags;
-	cm->expression = startExpr;
-	cm->valid = true;
-
-	if (!CFLi_ReplaceProhibitedCharInfo(&mii)) {
-		CFLi_AddRecentDBData(&mii);
-	} else {
-		dbglog("CFL_InitCharModel: recent-DB add skipped - author is on this console's own local nn::ubl blocklist (CFLi_ReplaceProhibitedCharInfo)\n");
-	}
-
-	dbglog("CFL_InitCharModel: complete\n");
-	return true;
 }
 
 bool CFL_SetExpression(CFLCharModel* cm, CFLExpression expression)
@@ -2276,7 +2441,7 @@ void CFL_DrawIconHead(CFLCharModel* cm, CFLExpression expression, const CFLIconS
 	}
 }
 
-bool CFL_CommandMakeModelIcon(CFLCharModel* cm, CFLExpression expression, int iconSize, const CFLIconSetting* setting, C3D_Tex* outIcon)
+static bool makeModelIcon(CFLCharModel* cm, CFLExpression expression, int iconSize, const CFLIconSetting* setting, C3D_Tex* outIcon, bool ownFrame)
 {
 	
 	dbglog("CFL_CommandMakeModelIcon: start iconSize=%d\n", iconSize);
@@ -2330,7 +2495,8 @@ bool CFL_CommandMakeModelIcon(CFLCharModel* cm, CFLExpression expression, int ic
 	dbglog("CFL_CommandMakeModelIcon: about to draw head\n");
 
 	dbglog("CFL_CommandMakeModelIcon: about to C3D_FrameBegin(SYNCDRAW)\n");
-	if (!C3D_FrameBegin(C3D_FRAME_SYNCDRAW)) {
+	if (!ownFrame) CFL_RebindShader();   // the caller's frame has its own program bound
+	if (ownFrame && !C3D_FrameBegin(C3D_FRAME_SYNCDRAW)) {
 		C3D_RenderTargetDelete(iconTarget);
 		C3D_TexDelete(outIcon);
 		return false;
@@ -2370,14 +2536,28 @@ bool CFL_CommandMakeModelIcon(CFLCharModel* cm, CFLExpression expression, int ic
 		dbglog("CFL_CommandMakeModelIcon: cflIconDrawCharModelParts (head) returned\n");
 
 		GPUCMD_AddWrite(GPUREG_FRAMEBUFFER_FLUSH, 1);
-	C3D_FrameEnd(0);
+	if (ownFrame) {
+		C3D_FrameEnd(0);
 
-	dbglog("CFL_CommandMakeModelIcon: C3D_FrameEnd returned, finishing up\n");
+		dbglog("CFL_CommandMakeModelIcon: C3D_FrameEnd returned, finishing up\n");
 
-	C3D_FrameSync();
-	C3D_RenderTargetDelete(iconTarget);
+		C3D_FrameSync();
+		C3D_RenderTargetDelete(iconTarget);
+	} else {
+		queueTargetCleanup(iconTarget);
+	}
 	C3D_TexSetFilter(outIcon, GPU_LINEAR, GPU_LINEAR);
 	C3D_TexSetWrap(outIcon, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
 	dbglog("CFL_CommandMakeModelIcon: done\n");
 	return true;
+}
+
+bool CFL_CommandMakeModelIcon(CFLCharModel* cm, CFLExpression expression, int iconSize, const CFLIconSetting* setting, C3D_Tex* outIcon)
+{
+	return makeModelIcon(cm, expression, iconSize, setting, outIcon, true);
+}
+
+bool CFL_DrawModelIcon(CFLCharModel* cm, CFLExpression expression, int iconSize, const CFLIconSetting* setting, C3D_Tex* outIcon)
+{
+	return makeModelIcon(cm, expression, iconSize, setting, outIcon, false);
 }
